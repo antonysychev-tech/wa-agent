@@ -24,6 +24,7 @@ const agent = require('./agent');
 const store = require('./store'); // старый слой: seen / blocked / escalations (для админки)
 const adminAssistant = require('./admin_assistant'); // ИИ-редактор базы знаний (админский чат)
 const kbCollector = require('./kb_collector'); // сбор фактов из ТГ-рассылки + модерация черновиков
+const { parseBusinessExternalId } = require('./business_identity');
 
 // Лимит на одну картинку в base64. Важно, чтобы VISION_MAX_IMAGES × этот лимит
 // укладывался в лимит тела запроса (JSON_BODY_LIMIT в server.js, по умолчанию
@@ -330,6 +331,39 @@ function createAssistantRouter(deps = {}) {
     try {
       await astore.setOperatorMode(req.params.id, !!(req.body && req.body.on));
       res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Telegram Business owner writes in the same client chat. Record that reply
+  // without sending it again, and turn off AI before processing another turn.
+  router.post('/business/operator-message', requireAdmin, async (req, res) => {
+    try {
+      const externalId = req.body && req.body.external_id;
+      const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+      if (!parseBusinessExternalId(externalId) || !content) {
+        return res.status(400).json({ error: 'Invalid business message' });
+      }
+      const conv = await astore.getOrCreateConversation({ channel: 'telegram', external_id: externalId });
+      await astore.setOperatorMode(conv.id, true);
+      await astore.saveMessage(conv.id, 'operator', content);
+      res.json({ ok: true, conversation_id: conv.id });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // The owner uses Telegram's Manage Bot link to pause or resume this chat.
+  router.post('/business/operator-mode', requireAdmin, async (req, res) => {
+    try {
+      const externalId = req.body && req.body.external_id;
+      if (!parseBusinessExternalId(externalId) || typeof req.body?.on !== 'boolean') {
+        return res.status(400).json({ error: 'Invalid business mode' });
+      }
+      const conv = await astore.getOrCreateConversation({ channel: 'telegram', external_id: externalId });
+      await astore.setOperatorMode(conv.id, req.body.on);
+      res.json({ ok: true, conversation_id: conv.id, operator_mode: req.body.on });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }

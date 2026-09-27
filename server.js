@@ -629,7 +629,7 @@ async function sendTelegram(chatId, text) {
   const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify(require('./business_identity').telegramSendPayload(chatId, text)),
   });
   const data = await r.json();
   if (!data.ok) throw new Error('Telegram API: ' + (data.description || r.status));
