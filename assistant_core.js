@@ -16,6 +16,7 @@ const agent = require('./agent');
 const astore = require('./assistant_store');
 const fastAnswers = require('./fast_answers');
 const companyKnowledge = require('./company_knowledge');
+const { parseBusinessExternalId } = require('./business_identity');
 
 const { OWNER_NAME } = agent;
 
@@ -87,6 +88,10 @@ async function processMessage({
   language = null,
   context = null,
 }) {
+  const business = channel === 'telegram' && Boolean(parseBusinessExternalId(external_id));
+  const personal = business && String(external_id).startsWith('bizp:');
+  // A Business chat must never silently fall back to the Kimi account.
+  if (business && !agent.businessReady()) throw new Error('Business OpenAI API key is not configured');
   const text = (message || '').trim();
   const imageList = Array.isArray(images) ? images.filter((i) => i && i.b64 && i.mime) : [];
   const hasPhoto = Boolean(photo) || imageList.length > 0;
@@ -115,7 +120,7 @@ async function processMessage({
     const allowed = takePhotoQuota(`${channel}:${external_id}`, imageList.length);
     quotaDropped = imageList.length - allowed;
     if (allowed > 0) {
-      photoData = await agent.describeImages(imageList.slice(0, allowed), caption);
+      photoData = await agent.describeImages(imageList.slice(0, allowed), caption, { business });
     } else {
       console.warn(`⚠️  Лимит фото исчерпан для ${channel}:${external_id} (${PHOTO_RATE_PER_HOUR}/час)`);
     }
@@ -149,6 +154,7 @@ async function processMessage({
     cost: agent.costOf({
       visionPromptTokens: visionUsage.prompt_tokens,
       visionCompletionTokens: visionUsage.completion_tokens,
+      business,
     }),
     ...extra,
   });
@@ -156,10 +162,12 @@ async function processMessage({
   // Оператор забрал чат на себя → ИИ не отвечает.
   if (conv.operator_mode) return emptyResult({ operator_mode: true });
 
-  let fast = fastAnswers.lookup({ text, topic: faqTopic, language, hasPhoto });
+  // Business needs one consistent AInton persona, including the first reply.
+  // Route it through Sol instead of returning an unintroduced canned answer.
+  let fast = business ? null : fastAnswers.lookup({ text, topic: faqTopic, language, hasPhoto });
   const navigation = new Set(['service_choice', 'handbook', 'notes', 'payment', 'mileage', 'application', 'availability', 'service_question']);
   if (fast && !navigation.has(fast.id) && await astore.hasReviewedKnowledgeSince('2026-09-22T00:00:00Z')) fast = null;
-  if (!fast && !hasPhoto) fast = await companyKnowledge.testAnswer(text, language);
+  if (!business && !fast && !hasPhoto) fast = await companyKnowledge.testAnswer(text, language);
   if (fast) {
     if ((await astore.getConversation(conv.id)).operator_mode) return emptyResult({ operator_mode: true });
     await astore.saveMessage(conv.id, 'assistant', fast.text, {
@@ -200,20 +208,24 @@ async function processMessage({
     (photoData ? agent.buildPhotoQuery(photoData, caption) : '') ||
     history[history.length - 1].content;
 
-  const { examples, facts, embedTokens } = await agent.retrieveContext(query);
+  // A personal chat must not receive company knowledge or another customer's style.
+  const { examples, facts, embedTokens } = personal
+    ? { examples: [], facts: [], embedTokens: 0 }
+    : await agent.retrieveContext(query, { business });
   const firstTurn = !history.some((m) => m.role === 'assistant');
-  let systemPrompt = agent.buildSystemPrompt({
+  let systemPrompt = personal ? agent.buildPersonalPrompt({ firstTurn }) : agent.buildSystemPrompt({
     examples,
     facts,
     firstTurn,
     photo: photoData,
     photoCaption: caption,
+    business,
   });
   systemPrompt += '\nUse short, respectful instructions and one next action. Reply in the language of the user’s latest message, including Georgian. Use the term хендбук / handbook, never брошюра. Display US phone numbers without +1. Do not claim a payment, service update or attachment was filed unless the system confirms it. The DMV form can be picked up from the company or printed. Supplies are also available from the company; at the service shop the form must be handed directly to Harry or Alex. If uncertain, ask one short question.';
-  if (context) systemPrompt += '\nCurrent bot step: ' + String(context).slice(0, 300);
+  if (context && !personal) systemPrompt += '\nCurrent bot step: ' + String(context).slice(0, 300);
   let rawReply, usage = {}, finishReason;
   try {
-    ({ text: rawReply, usage, finishReason } = await agent.generateReply(systemPrompt, history));
+    ({ text: rawReply, usage, finishReason } = await agent.generateReply(systemPrompt, history, { business }));
   } catch {
     // Keep the saved question available to staff after provider failure; do not
     // expose provider errors or keep retrying the same paid request for minutes.
@@ -238,7 +250,10 @@ async function processMessage({
 
   const baseText =
     replyText ||
-    (escalate ? `Вопрос сохранён для ${OWNER_NAME}. Для связи с компанией откройте «Контакты».` : '');
+    (escalate
+      ? personal ? `Передам твоё сообщение Антону, когда он сможет ответить.`
+        : `Вопрос сохранён для ${OWNER_NAME}. Для связи с компанией откройте «Контакты».`
+      : '');
 
   // Про отброшенные по лимиту фото клиенту надо сказать честно — иначе он решит,
   // что ассистент посмотрел всё, и не пришлёт важный кадр повторно.
@@ -261,6 +276,7 @@ async function processMessage({
     embedTokens,
     visionPromptTokens: visionUsage.prompt_tokens,
     visionCompletionTokens: visionUsage.completion_tokens,
+    business,
   });
 
   if (finalText) {

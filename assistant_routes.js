@@ -142,6 +142,13 @@ function createAssistantRouter(deps = {}) {
       if (imgError) return res.status(400).json({ error: imgError });
 
       if (!external_id) return res.status(400).json({ error: 'Нужен external_id' });
+      const personalBusiness = channel === 'telegram' &&
+        Boolean(parseBusinessExternalId(external_id)) && String(external_id).startsWith('bizp:');
+      if (personalBusiness && images.length) return res.status(400).json({ error: 'Personal image chat is not supported' });
+      if (channel === 'telegram' && /^bizp?:/.test(String(external_id))) {
+        if (!parseBusinessExternalId(external_id)) return res.status(400).json({ error: 'Invalid business chat' });
+        if (!agent.businessReady()) return res.status(503).json({ error: 'Business assistant is not configured' });
+      }
       // Фото без подписи — валидный случай: текст не обязателен, если есть картинка.
       if (!images.length && !faqTopic && (!message || !String(message).trim())) {
         return res.status(400).json({ error: 'Нужен message или images' });
@@ -173,7 +180,7 @@ function createAssistantRouter(deps = {}) {
       // Эскалацию дублируем в старую панель «Переданные вопросы», если задан хук.
       // В question отдаём user_text: для фото это текстовый след с описанием,
       // иначе в панели была бы пустая строка или голое «[Фото]».
-      if (result.escalate && typeof onEscalation === 'function') {
+      if (result.escalate && !personalBusiness && typeof onEscalation === 'function') {
         onEscalation({
           channel,
           external_id,

@@ -95,18 +95,18 @@ test('current online contact policy survives compound and foreign-language retri
 });
 
 test('actual agent requests disable reasoning, limit output and avoid SDK retries', async () => {
-  const constructors = [], requests = [];
-  const envKeys = ['MOONSHOT_API_KEY', 'OPENAI_API_KEY', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'KIMI_MODEL', 'ASSISTANT_REPLY_MAX_TOKENS', 'KIMI_TIMEOUT_MS'];
+  const constructors = [], requests = [], embeddings = [];
+  const envKeys = ['MOONSHOT_API_KEY', 'OPENAI_API_KEY', 'BUSINESS_OPENAI_API_KEY', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'KIMI_MODEL', 'ASSISTANT_REPLY_MAX_TOKENS', 'KIMI_TIMEOUT_MS'];
   const previous = Object.fromEntries(envKeys.map(k => [k, process.env[k]]));
-  Object.assign(process.env, { MOONSHOT_API_KEY: 'synthetic', OPENAI_API_KEY: 'synthetic', SUPABASE_URL: 'https://example.test', SUPABASE_SERVICE_KEY: 'synthetic', KIMI_MODEL: 'kimi-k2.6', ASSISTANT_REPLY_MAX_TOKENS: '1200', KIMI_TIMEOUT_MS: '30000' });
+  Object.assign(process.env, { MOONSHOT_API_KEY: 'synthetic-kimi', OPENAI_API_KEY: 'synthetic-embed', BUSINESS_OPENAI_API_KEY: 'synthetic-business', SUPABASE_URL: 'https://example.test', SUPABASE_SERVICE_KEY: 'synthetic', KIMI_MODEL: 'kimi-k2.6', ASSISTANT_REPLY_MAX_TOKENS: '1200', KIMI_TIMEOUT_MS: '30000' });
   const original = Module._load;
   Module._load = function(request, parent) {
     if (parent?.filename.endsWith('agent.js')) {
       if (request === 'dotenv') return { config() {} };
       if (request === 'openai') return class { constructor(options) {
         constructors.push(options);
-        this.chat = { completions: { create: async (body, opts) => { requests.push({ body, opts }); return { choices: [{ message: { content: 'Synthetic answer' }, finish_reason: 'stop' }], usage: {} }; } } };
-        this.embeddings = { create: async () => ({ data: [{ embedding: [0] }], usage: {} }) };
+        this.chat = { completions: { create: async (body, opts) => { requests.push({ body, opts, key: options.apiKey }); return { choices: [{ message: { content: Array.isArray(body.messages.at(-1)?.content) ? '{"category":"car","description":"Synthetic image"}' : 'Synthetic answer' }, finish_reason: 'stop' }], usage: {} }; } } };
+        this.embeddings = { create: async () => { embeddings.push(options.apiKey); return { data: [{ embedding: [0] }], usage: {} }; } };
       } };
       if (request === '@supabase/supabase-js') return { createClient: () => ({ from() { const q = { select: () => q, eq: () => q, order: () => q, limit: async () => ({ data: [] }) }; return q; }, rpc: async () => ({ data: [] }) }) };
       if (request === './company_knowledge') return { context: async () => [] };
@@ -123,6 +123,17 @@ test('actual agent requests disable reasoning, limit output and avoid SDK retrie
     assert.equal(requests[0].body.max_tokens, 1200);
     assert.equal(requests[0].opts.timeout, 30000);
     assert.deepEqual(requests.map(r => r.body.thinking), [{ type: 'disabled' }, { type: 'disabled' }]);
+    assert.equal(agent.businessReady(), true);
+    const prompt = agent.buildSystemPrompt({ examples: [], facts: [], firstTurn: true, business: true });
+    assert.match(prompt, /AInton, электронный менеджер/);
+    assert.doesNotMatch(prompt, /ИИ-помощник Alex/);
+    await agent.generateReply('System', [{ role: 'user', content: 'Hello' }], { business: true });
+    await agent.retrieveContext('Hello', { business: true });
+    await agent.describeImages([{ b64: 'c3ludGhldGlj', mime: 'image/png' }], '', { business: true });
+    assert.equal(constructors[2].apiKey, 'synthetic-business');
+    assert.ok(requests.slice(2).every(r => r.key === 'synthetic-business' && r.body.model === 'gpt-6-sol'));
+    assert.deepEqual(embeddings, ['synthetic-embed', 'synthetic-business']);
+    assert.equal(agent.costOf({ promptTokens: 1_000_000, completionTokens: 1_000_000, business: true }).usd, 12);
   } finally {
     Module._load = original;
     for (const k of envKeys) { if (previous[k] === undefined) delete process.env[k]; else process.env[k] = previous[k]; }
@@ -187,14 +198,16 @@ test('notification failure can retry and missing settings never send to guessed 
 
 function mockedCore({ takeover = false, generationFails = false, updatedKnowledge = false } = {}) {
   const saved = [], statuses = [];
-  let taken = false, generated = 0;
+  let taken = false, generated = 0, retrievals = 0, personalPrompt = 0;
+  const generationOptions = [];
   const original = Module._load;
   Module._load = function(request, parent) {
     if (parent?.filename.endsWith('assistant_core.js')) {
       if (request === './company_knowledge') return { testAnswer: async () => null };
-      if (request === './agent') return { OWNER_NAME: 'Owner', costOf: () => ({}),
-        retrieveContext: async () => ({ facts: [], examples: [], embedTokens: 0 }), buildSystemPrompt: () => 'Test',
-        generateReply: async () => { generated++; taken = takeover; if (generationFails) throw Error('provider failed'); return { text: 'Synthetic reply', usage: {} }; },
+      if (request === './agent') return { OWNER_NAME: 'Owner', costOf: () => ({}), businessReady: () => true,
+        retrieveContext: async () => { retrievals++; return { facts: [], examples: [], embedTokens: 0 }; },
+        buildSystemPrompt: () => 'Test', buildPersonalPrompt: () => { personalPrompt++; return 'Personal'; },
+        generateReply: async (_prompt, _history, options) => { generationOptions.push(options); generated++; taken = takeover; if (generationFails) throw Error('provider failed'); return { text: 'Synthetic reply', usage: {} }; },
         parseEscalation: text => ({ text, escalate: false, reason: '' }),
       };
       if (request === './assistant_store') return {
@@ -211,8 +224,22 @@ function mockedCore({ takeover = false, generationFails = false, updatedKnowledg
   let core;
   try { delete require.cache[require.resolve('./assistant_core')]; core = require('./assistant_core'); }
   finally { Module._load = original; }
-  return { core, saved, statuses, generated: () => generated };
+  return { core, saved, statuses, generated: () => generated,
+    retrievals: () => retrievals, personalPrompt: () => personalPrompt, generationOptions };
 }
+
+test('personal Business chat uses Sol route without company knowledge or canned business answers', async () => {
+  const m = mockedCore();
+  const result = await m.core.processMessage({
+    channel: 'telegram', external_id: 'bizp:["conn:synthetic","123456"]',
+    message: 'Где сервис?',
+  });
+  assert.equal(result.reply, 'Synthetic reply');
+  assert.equal(result.fast_answer, undefined);
+  assert.equal(m.retrievals(), 0);
+  assert.equal(m.personalPrompt(), 1);
+  assert.deepEqual(m.generationOptions, [{ business: true }]);
+});
 
 test('FAQ keeps full history without model use', async () => {
   const m = mockedCore();

@@ -5,6 +5,7 @@ const express = require('express');
 const { parseBusinessExternalId, telegramSendPayload } = require('./business_identity');
 
 const identity = 'biz:["conn:synthetic","123456"]';
+const personalIdentity = 'bizp:["conn:synthetic","123456"]';
 
 test('Business destinations stay separate from ordinary bot chats', () => {
   assert.deepEqual(parseBusinessExternalId(identity), {
@@ -13,9 +14,16 @@ test('Business destinations stay separate from ordinary bot chats', () => {
   assert.deepEqual(telegramSendPayload(identity, 'answer'), {
     chat_id: '123456', business_connection_id: 'conn:synthetic', text: 'answer',
   });
+  assert.deepEqual(telegramSendPayload(personalIdentity, 'answer'), {
+    chat_id: '123456', business_connection_id: 'conn:synthetic', text: 'answer',
+  });
+  assert.deepEqual(parseBusinessExternalId(personalIdentity), {
+    connectionId: 'conn:synthetic', chatId: '123456',
+  });
   assert.deepEqual(telegramSendPayload('123456', 'answer'), { chat_id: '123456', text: 'answer' });
   assert.equal(parseBusinessExternalId('biz:["conn","-100"]'), null);
   assert.throws(() => telegramSendPayload('biz:invalid', 'answer'));
+  assert.throws(() => telegramSendPayload('bizp:invalid', 'answer'));
 });
 
 test('only authenticated owner events can pause, record and resume Business chat', async () => {
@@ -33,7 +41,7 @@ test('only authenticated owner events can pause, record and resume Business chat
         saveMessage: async (...args) => { events.push(['message', ...args]); },
       };
       if (request === './service_billing') return { mountBilling: () => {} };
-      if (request === './agent') return { VISION_MAX_IMAGES: 4 };
+      if (request === './agent') return { VISION_MAX_IMAGES: 4, businessReady: () => false };
       if (['./assistant_core', './store', './admin_assistant', './kb_collector'].includes(request)) return {};
     }
     return old.apply(this, arguments);
@@ -53,6 +61,8 @@ test('only authenticated owner events can pause, record and resume Business chat
     body: JSON.stringify(body),
   });
   try {
+    assert.equal((await post('/assistant/chat', { channel: 'telegram', external_id: identity, message: 'Hello' }, 'synthetic-key')).status, 503);
+    assert.equal((await post('/assistant/chat', { channel: 'telegram', external_id: personalIdentity, message: 'Hello' }, 'synthetic-key')).status, 503);
     assert.equal((await post('/assistant/business/operator-message', { external_id: identity, content: 'I take over' })).status, 401);
     assert.equal((await post('/assistant/business/operator-message', { external_id: '123456', content: 'bad' }, 'synthetic-key')).status, 400);
     assert.equal((await post('/assistant/business/operator-message', { external_id: identity, content: 'I take over' }, 'synthetic-key')).status, 200);
